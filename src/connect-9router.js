@@ -13,7 +13,7 @@
  * Usage:
  *   node src/connect-9router.js \
  *     --base http://localhost:20128 --password 123456 \
- *     --api-key slk_ORfFhj0U...(43-char, slk_ + base64url) [--name "Alysis Code"] [--prefix alysiscode]
+ *     --api-key YOUR_KEY (43-char, slk_ + base64url) [--name "Alysis Code"] [--prefix alysiscode]
  *
  *   node src/connect-9router.js                  # register every key in keys.txt
  *   node src/connect-9router.js --model <id>     # pin the connection's default model
