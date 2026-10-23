@@ -69,6 +69,7 @@ curl https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1/chat/completio
 ```
 
 ## 🛠 Quick start
+Install once: `npm install` pulls `puppeteer-core`, the embedded solver's browser engine, and the solver needs a real Chrome (`winget install --id Google.Chrome`, or point `CHROME_PATH` at one). Then mint with `node src/cli.js --count 1` (or `npm start` → **Mint keys**) — a key lands in `keys.txt` only after a live `chat-200`.
 
 ### 🖱️ The launcher
 
