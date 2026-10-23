@@ -95,11 +95,15 @@ const tls = require('tls');
 const http = require('http');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
+const { solveCaptcha: solveWithBrowser } = require('./solver.js');
 
 const ROOT = path.basename(__dirname) === 'src' ? path.resolve(__dirname, '..') : __dirname;
 const KEYS_FILE = path.join(ROOT, 'keys.txt');
 const ACCOUNTS_FILE = path.join(ROOT, 'accounts.jsonl');
 const OUT_DIR = path.join(ROOT, 'out');
+const DEAD_FILE = path.join(ROOT, 'keys-dead.txt');
+/** Dead keys from the last verify run (one `key<TAB># reason` per line). */
+const writeDead = (dead) => fs.writeFileSync(DEAD_FILE, dead.map((d) => `${d.key}\t# ${d.why}`).join('\n') + (dead.length ? '\n' : ''));
 
 /** Supabase project behind alysiscode.com; the anon key is the public client key. */
 const SUPA = process.env.ALYSISCODE_SUPABASE_URL || 'https://vzigujbcjjmpntxhmyvr.supabase.co';
@@ -127,7 +131,7 @@ const has = (name) => argv.includes(`--${name}`) || argv.includes(`-${name}`);
 if (has('help') || has('h')) {
   console.log(`alysiscode-bulk-apikey — mint Alysis Code accounts, one gateway key each, verified by a live chat call.
 
-  node src/cli.js --count 1                     mint (a key is kept only after a chat 200)
+  node src/cli.js --auto --count 1              mint (a key is kept only after a chat 200)
   node src/cli.js --verify-only                 re-check every key in keys.txt
   node src/cli.js --screen                      test your proxy list against the Supabase settings endpoint
   node src/cli.js --connect-9router             register keys.txt with a local 9Router
@@ -137,17 +141,15 @@ if (has('help') || has('h')) {
   --model <id>       model used for the live gate              [deepseek-flash]
   --alt-models L     comma list tried after --model  [glm-5.3-flash,gpt-6-luna]
   --pool <file>      proxy list, one exit per line (env ALYSISCODE_PROXIES)  [optional]
-  --captcha-cmd S    command that prints one Turnstile token   [ANALYSISCODE_CAPTCHA_CMD]
-  --captcha-timeout S  seconds allowed per captcha solve                     [420]
+  --auto             solve the Turnstile with the embedded src/solver.js       [on]
   --tries N          exits tried per account before giving up                  [4]
   --addr-tries N     addresses tried per exit                                 [3]
   --cooldown MIN     minutes an exit stays out after a sign-up throttle       [15]
   --timeout MS       per-request timeout                                  [60000]
 
-Registration is guarded by Cloudflare Turnstile, so --captcha-cmd is REQUIRED to
-mint (it is not needed for --verify-only / --screen / --connect-9router). One
-TURNSTILE sitekey 0x4AAAAAAFCGJnIFvPtF_pgs token per action: 'signup' and, later,
-'device_approve'. Placeholders: {action} {url} {label} {proxy} {tokenfile}.
+Registration is guarded by Cloudflare Turnstile. The bundled src/solver.js solves
+it automatically (--auto is the default) — no external command is needed. Advanced
+escape hatches live in ADVANCED.md.
 
 Requests go through the exits in your proxy list when one is provided (--pool or
 the ALYSISCODE_PROXIES env) and the run FAILS CLOSED if none of them reach the
@@ -377,11 +379,17 @@ async function pollConfirm(exit, plain, baseline, timeoutMs = 150000) {
  * login and device-approve, and the edge function checks the token's action, so
  * a token minted for `signup` is refused by `device-approve`.
  */
-function solveCaptcha(action, page, exit, tag, attempt) {
-  if (!CAPTCHA_CMD) {
-    throw new Error('CAPTCHA_REQUIRED: Alysis is Turnstile-gated — pass --captcha-cmd (placeholders {action} {url} {label} {proxy} {tokenfile})');
-  }
+async function solveCaptcha(action, page, exit, tag, attempt) {
   const label = `alysis-${tag}-${action === 'signup' ? 'su' : 'ap'}-${attempt}`;
+  if (!CAPTCHA_CMD) {
+    // Embedded rail (default): src/solver.js drives a real, headed Chrome over
+    // the account's pinned exit. The panel is action-scoped, so the token is read
+    // off the page whose widget carries the right action.
+    const r = await solveWithBrowser({ type: 'turnstile', sitekey: SITEKEY, url: page, proxy: exit ? exit.line : null });
+    const tok = r && r.token;
+    if (!tok) throw new Error('CAPTCHA_FAILED: the embedded solver returned no token');
+    return tok;
+  }
   const tokenfile = path.join(OUT_DIR, `.turnstile-${label}.txt`);
   try { fs.unlinkSync(tokenfile); } catch { /* */ }
   const cmd = CAPTCHA_CMD
@@ -413,7 +421,7 @@ async function signupAccount(exit, idx) {
     const password = randPass();
     const baseline = (await inboxIds(exit, box.plain).catch(() => [])).map((m) => m.id);
     const t0 = Date.now();
-    const cap = solveCaptcha('signup', `${SITE}/signup`, exit, `${idx}${a}`, 0);
+    const cap = await solveCaptcha('signup', `${SITE}/signup`, exit, `${idx}${a}`, 0);
     if (!cap) { lastReason = 'captcha: no signup token'; log(`  address ${box.plain}: ${lastReason} (${Date.now() - t0}ms)`); continue; }
 
     const sup = await exitJson(exit, `${SUPA}/auth/v1/signup`, {
@@ -445,7 +453,7 @@ async function signupAccount(exit, idx) {
 
     let approved = false;
     for (let at = 0; at < 3 && !approved; at++) {
-      const capA = solveCaptcha('device_approve', `${SITE}/activate`, exit, `${idx}${a}`, at);
+      const capA = await solveCaptcha('device_approve', `${SITE}/activate`, exit, `${idx}${a}`, at);
       if (!capA) { log('  captcha: no device_approve token'); continue; }
       const ap = await exitJson(exit, `${FN}/device-approve`, { method: 'POST', body: { user_code: ucode, captcha_token: capA }, headers: { authorization: `Bearer ${session}` } });
       if (ap.status < 300 && ap.json && ap.json.status === 'approved') { approved = true; break; }
@@ -488,10 +496,6 @@ const exitUsable = (e) => (burns.get(e ? e.line : 'direct') || 0) < Date.now();
 async function mint() {
   const exits = loadExits();
   if (SCREEN) return void (await screen(exits));
-  if (!CAPTCHA_CMD) {
-    console.error('Alysis registration is Turnstile-gated: pass --captcha-cmd (see --help). Nothing was attempted.');
-    process.exit(1);
-  }
   log(`alysis · ${COUNT} key(s) · exits ${exits.filter(Boolean).length || 'direct'} · cooldown ${COOLDOWN_MS / 60000}min · keys land in ${KEYS_FILE}`);
   let made = 0;
   for (let i = 0; i < COUNT; i++) {
@@ -539,16 +543,20 @@ async function verifyOnly() {
   const keys = readKeys();
   if (!keys.length) { console.log(`no keys in ${KEYS_FILE}`); process.exit(0); }
   let live = 0;
+  const dead = [];
   for (let i = 0; i < keys.length; i++) {
     const exit = usable.length ? usable[i % usable.length] : null;
     try {
       const g = await chatGate(exit, keys[i], MODEL);
       if (g.ok) live++;
+      else dead.push({ key: keys[i], why: `chat ${g.status}` });
       console.log(`  ${g.ok ? 'OK ' : 'ERR'} ${keys[i].slice(0, 12)}... chat=${g.status}`);
     } catch (e) {
+      dead.push({ key: keys[i], why: String(e.message).slice(0, 90) });
       console.log(`  ERR ${keys[i].slice(0, 12)}... ${String(e.message).slice(0, 90)}`);
     }
   }
+  writeDead(dead);
   console.log(`verify: ${live}/${keys.length} keys live on ${MODEL}`);
   process.exit(live === keys.length ? 0 : 1);
 }
