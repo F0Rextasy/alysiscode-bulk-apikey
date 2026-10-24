@@ -50,7 +50,7 @@
  *   --captcha-cmd S  command that prints one Turnstile token     [env ANALYSISCODE_CAPTCHA_CMD]
  *   --model <id>     model used for the live gate              [deepseek-flash]
  *   --alt-models L   comma list tried after --model      [glm-5.3-flash,gpt-6-luna]
- *   --tries N        exits tried per account before giving up              [4]
+ *   --exits N        exits tried per account before giving up              [6]
  *   --addr-tries N   addresses tried per exit (address-side failures)      [3]
  *   --cooldown MIN   minutes an exit stays out after a sign-up throttle    [15]
  *   --timeout MS     per-request timeout                               [60000]
@@ -142,7 +142,7 @@ if (has('help') || has('h')) {
   --alt-models L     comma list tried after --model  [glm-5.3-flash,gpt-6-luna]
   --pool <file>      proxy list, one exit per line (env ALYSISCODE_PROXIES)  [optional]
   --auto             solve the Turnstile with the embedded src/solver.js       [on]
-  --tries N          exits tried per account before giving up                  [4]
+  --exits N          exits tried per account before giving up                  [6]
   --addr-tries N     addresses tried per exit                                 [3]
   --cooldown MIN     minutes an exit stays out after a sign-up throttle       [15]
   --timeout MS       per-request timeout                                  [60000]
@@ -160,7 +160,7 @@ is a single-account smoke test.`);
 }
 
 const COUNT = Math.max(1, parseInt(arg('count', '1'), 10) || 1);
-const TRIES = Math.max(1, parseInt(arg('tries', '4'), 10) || 4);
+const EXITS = Math.max(1, parseInt(arg('exits', '6'), 10) || 6);
 const ADDR_TRIES = Math.max(1, parseInt(arg('addr-tries', '3'), 10) || 3);
 const COOLDOWN_MS = Math.max(0, (parseInt(arg('cooldown', '15'), 10) || 0) * 60000);
 const TIMEOUT_MS = Math.max(5000, parseInt(arg('timeout', '60000'), 10) || 60000);
@@ -312,6 +312,15 @@ function loadExits() {
   if (!exits.length) throw new Error(`${poolFile} has no usable exits — refusing to run (fail-closed).`);
   return exits;
 }
+/** A dead exit, not a panel verdict — the flow rotates to the next candidate. */
+const isExitError = (e) =>
+  /proxy connect failed|proxy CONNECT refused|proxy timeout|connect timeout|connect failed|ETIMEDOUT|ECONNREFUSED|ECONNRESET|ECONNABORTED|EPIPE|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN|socket hang up|secureConnect|TLS|handshake/i.test(
+    String((e && e.message) || e),
+  );
+
+/** `host:port` of the exit in play, or `direct` when the pool is empty. */
+const exitLabel = (e) => (e ? `${e.host}:${e.port}` : 'direct');
+
 
 async function screen(exits) {
   let ok = 0;
@@ -498,14 +507,18 @@ async function mint() {
   if (SCREEN) return void (await screen(exits));
   log(`alysis · ${COUNT} key(s) · exits ${exits.filter(Boolean).length || 'direct'} · cooldown ${COOLDOWN_MS / 60000}min · keys land in ${KEYS_FILE}`);
   let made = 0;
+  const routes = exits[0] === null ? 1 : EXITS;
+  let transportDead = 0;
   for (let i = 0; i < COUNT; i++) {
     let lastErr = null;
-    for (let t = 0; t < TRIES; t++) {
+    let lastWasExit = false;
+    for (let a = 0; a < routes; a++) {
       const pool = exits.filter(exitUsable);
       if (!pool.length) { lastErr = new Error('every exit in the pool is cooling down after a sign-up throttle'); break; }
-      const exit = pool[(i + t) % pool.length];
+      const exit = pool[(i + a) % pool.length];
+      lastWasExit = false;
       try {
-        const rec = await signupAccount(exit, `${i}${t}`);
+        const rec = await signupAccount(exit, `${i}${a}`);
         let live = null;
         let gate = null;
         for (const model of [MODEL, ...ALT_MODELS]) {
@@ -525,15 +538,26 @@ async function mint() {
         break;
       } catch (e) {
         lastErr = e;
+        lastWasExit = isExitError(e);
+        if (lastWasExit) {
+          const where = exit ? `exit ${a + 1}/${routes} ${exitLabel(exit)}` : `direct attempt ${a + 1}/${routes}`;
+          log(`account ${i + 1}: ${where} dead (${String(e.message).slice(0, 70)})${exit ? ' → next exit' : ''}`);
+        }
         if (e.exitThrottled) {
           burns.set(exit ? exit.line : 'direct', Date.now() + COOLDOWN_MS);
           log(`exit ${exit ? `${exit.host}:${exit.port}` : 'direct'} throttled — cooling down ${COOLDOWN_MS / 60000}min, next exit`);
         }
       }
     }
+    if (lastWasExit) transportDead++;
     if (lastErr) log(`account ${i + 1}: ${String(lastErr.message).slice(0, 160)}`);
   }
   log(`done — ${made}/${COUNT} key(s) written to ${KEYS_FILE}`);
+  if (!made && transportDead === COUNT) {
+    const route = exits[0] === null ? 'direct mode (no proxy list)' : `${exits.length}-exit pool`;
+    console.error(`[fatal] no usable route — ${COUNT} account(s) × ${routes} candidate(s) over ${route}: every attempt died at the transport layer.`);
+    process.exit(1);
+  }
   if (made < COUNT) process.exitCode = 1;
 }
 
